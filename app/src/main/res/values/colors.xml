@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black_opaque">#b3030304</color>
+    <color name="lavender_gray">#d3d2d9</color>
+    <color name="rich_black70">#4d4d52</color>
+    <color name="rich_black90">#1E1E20</color>
+    <color name="snow_white">#ffffff</color>
+    <color name="full_transparency">#00000000</color>
+    <color name="background_sheet_dark">#252544</color>
+</resources>

@@ -1,0 +1,128 @@
+variables:
+  GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2"
+  ANDROID_SDK_ROOT: "$CI_PROJECT_DIR/.android-sdk"
+  ANDROID_HOME: "$CI_PROJECT_DIR/.android-sdk"
+
+default:
+  image: eclipse-temurin:17-jdk-jammy
+  interruptible: true
+  cache:
+    key:
+      files:
+        - gradle/wrapper/gradle-wrapper.properties
+    paths:
+      - .gradle/caches/
+      - .gradle/wrapper/
+      - .android-sdk/
+
+stages:
+  - build
+  - screenshot
+
+.android_sdk_before_script: &android_sdk_before_script
+  before_script:
+    - apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wget unzip git > /dev/null
+    # sdkmanager expects this file in non-interactive / CI environments (avoids obscure failures).
+    - mkdir -p ~/.android && touch ~/.android/repositories.cfg
+    - export JAVA_HOME="${JAVA_HOME:-/opt/java/openjdk}"
+    - |
+      if [ ! -x "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+        mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+        wget -nv -O /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+        unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools/tmp"
+        mv "$ANDROID_SDK_ROOT/cmdline-tools/tmp/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+        rm -rf "$ANDROID_SDK_ROOT/cmdline-tools/tmp"
+      fi
+    - export PATH="$PATH:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools"
+    # In Docker, --licenses sometimes exits 1 even when prompts were answered; do not fail the job on that alone.
+    - yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null 2>&1 || true
+    - sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+# MRs and the default branch only (same as before).
+.android_mr_or_default_branch: &android_mr_or_default_branch
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.android_job:
+  <<: *android_sdk_before_script
+  <<: *android_mr_or_default_branch
+
+assemble_debug:
+  extends: .android_job
+  stage: build
+  script:
+    - chmod +x ./gradlew
+    - ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+# Fails the job when pixels differ from baselines under app/src/test/screenshots/.
+# compareRoborazziDebug only writes diff artifacts and exits successfully; use verifyRoborazziDebug for CI gates.
+compare_roborazzi:
+  extends: .android_job
+  stage: screenshot
+  needs: ["assemble_debug"]
+  script:
+    - chmod +x ./gradlew
+    - ./gradlew :app:verifyRoborazziDebug --no-daemon --stacktrace
+  artifacts:
+    when: on_failure
+    expire_in: 1 week
+    paths:
+      - app/build/reports/roborazzi/
+      - app/build/test-results/roborazzi/
+  rules:
+    - if: '$CI_COMMIT_MESSAGE =~ /Update screenshots/'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+noop_on_screenshots_only:
+  stage: screenshot
+  image: alpine:3.20
+  before_script: []
+  needs: []
+  script:
+    - echo "Pipeline includes automated screenshot update commit; compare job skipped. No-op OK."
+  rules:
+    - if: '$CI_COMMIT_MESSAGE =~ /Update screenshots/'
+      when: on_success
+    - when: never
+
+update_screenshots:
+  <<: *android_sdk_before_script
+  stage: screenshot
+  needs: ["assemble_debug"]
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: "0"
+  script:
+    - chmod +x ./gradlew
+    - ./gradlew :app:recordRoborazziDebug --no-daemon --stacktrace
+    - git config user.email "${ROBORAZZI_BOT_EMAIL:-gitlab-ci@example.com}"
+    - git config user.name "${ROBORAZZI_BOT_NAME:-GitLab Roborazzi}"
+    - git add app/src/test/screenshots/
+    - |
+      if git diff --cached --quiet; then
+        echo "No changes to commit — screenshots already match."
+        exit 0
+      fi
+    - 'git commit -m "${CI_COMMIT_REF_NAME}: Update screenshots"'
+    - |
+      PUSH_TOKEN="${CI_ACCESS_TOKEN:-$CI_JOB_TOKEN}"
+      PUSH_BRANCH="${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME:-$CI_COMMIT_REF_NAME}"
+      if [ -z "$PUSH_BRANCH" ]; then
+        echo "Could not determine target branch for push (set CI_MERGE_REQUEST_SOURCE_BRANCH_NAME or run on a branch pipeline)."
+        exit 1
+      fi
+      git push "https://gitlab-ci-token:${PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${PUSH_BRANCH}"
+  rules:
+    - if: '$CI_COMMIT_MESSAGE =~ /Update screenshots/'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_COMMIT_MESSAGE !~ /Update screenshots/'
+      when: manual
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_COMMIT_MESSAGE !~ /Update screenshots/'
+      when: manual
+      allow_failure: true
+    - when: never
